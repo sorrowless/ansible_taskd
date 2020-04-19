@@ -1,0 +1,18 @@
+---
+taskd: {}  # this is a map which should be defined by user
+taskd_defaults: # this is a map which should not be redefined by user
+  create_user: yes
+  username: taskd
+  data_location: /var/taskd
+  port: 53589
+  cert:
+    expiration_days: 3650
+    organization: "Personal organization"
+    cn: localhost
+    country: RU
+    state: Moscow
+    locality: Moscow
+  # Only one organization supported at this moment
+  org: Personal
+  # Only one user supported at this moment
+  user: Test User

@@ -1,0 +1,8 @@
+---
+BITS=4096
+EXPIRATION_DAYS={{ t.cert.expiration_days }}
+ORGANIZATION="{{ t.cert.organization }}"
+CN="{{ t.cert.cn }}"
+COUNTRY="{{ t.cert.country }}"
+STATE="{{ t.cert.state }}"
+LOCALITY="{{ t.cert.locality }}"

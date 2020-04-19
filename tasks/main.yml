@@ -1,0 +1,208 @@
+---
+- name: Merge user config data with defaults
+  set_fact:
+    t: "{{ taskd_defaults | combine(taskd, recursive=True) }}"
+  tags:
+    - always
+
+- name: Show target configuration
+  debug:
+    var: t
+    verbosity: 1
+
+- name: Install taskd package
+  package:
+    name: taskd
+    state: present
+
+- name: Create taskd user
+  user:
+    name: "{{ t.username }}"
+    comment: Taskd user
+    shell: /bin/false
+    password: '!'
+  when: t.create_user
+
+- name: Ensure data location
+  file:
+    path: "{{ t.data_location }}/pki"
+    state: directory
+    owner: "{{ t.username }}"
+    group: "{{ t.username }}"
+    mode: 0750
+
+- name: Ensure log directory
+  file:
+    path: /var/log/taskd
+    state: directory
+    owner: "{{ t.username }}"
+    group: "{{ t.username }}"
+    mode: 0755
+
+
+- name: Copy pki scripts to data location
+  copy:
+    remote_src: yes
+    src: /usr/share/taskd/pki/
+    dest: "{{ t.data_location }}/pki/"
+    owner: "{{ t.username }}"
+    group: "{{ t.username }}"
+    mode: 0750
+
+- name: Ensure proper permissions on generation scrips
+  file:
+    path: "{{ t.data_location }}/pki/"
+    mode: 0750
+    recurse: yes
+
+- name: Ensure vars file to generate on
+  template:
+    src: vars
+    dest: "{{ t.data_location }}/pki/vars"
+    owner: "{{ t.username }}"
+    group: "{{ t.username }}"
+    mode: 0750
+
+- name: Generate CA, server and client certificates
+  become: yes
+  become_user: "{{ t.username }}"
+  command: "{{ t.data_location }}/pki/generate"
+  args:
+    chdir: "{{ t.data_location }}/pki"
+    creates: "{{ t.data_location }}/pki/ca.key.pem"
+
+- name: Copy CA, server and client sertificates
+  copy:
+    src: "{{ t.data_location }}/pki/{{ item }}"
+    remote_src: yes
+    dest: "{{ t.data_location }}/{{ item }}"
+    owner: "{{ t.username }}"
+    group: "{{ t.username }}"
+  with_items:
+    - ca.cert.pem
+    - client.cert.pem
+    - client.key.pem
+    - server.cert.pem
+    - server.key.pem
+    - server.crl.pem
+
+- name: Init taskd configuration
+  become: yes
+  become_user: "{{ t.username }}"
+  command: "taskd init --data {{ t.data_location }}"
+  args:
+    creates: "{{ t.data_location }}/config"
+
+- name: Add taskd configuration
+  become: yes
+  become_user: "{{ t.username }}"
+  command: "{{ item }}"
+  with_items:
+    - "taskd config --data {{ t.data_location }} --force client.cert {{ t.data_location }}/client.cert.pem"
+    - "taskd config --data {{ t.data_location }} --force client.key {{ t.data_location }}/client.key.pem"
+    - "taskd config --data {{ t.data_location }} --force server.cert {{ t.data_location }}/server.cert.pem"
+    - "taskd config --data {{ t.data_location }} --force server.key {{ t.data_location }}/server.key.pem"
+    - "taskd config --data {{ t.data_location }} --force server.crl {{ t.data_location }}/server.crl.pem"
+    - "taskd config --data {{ t.data_location }} --force ca.cert {{ t.data_location }}/ca.cert.pem"
+    - "taskd config --data {{ t.data_location }} --force log /var/log/taskd/taskd.log"
+    - "taskd config --data {{ t.data_location }} --force pid.file {{ t.data_location }}/taskd.pid"
+    - "taskd config --data {{ t.data_location }} --force server '*:{{ t.port }}'"
+
+- name: Ensure systemd unit files
+  become: yes
+  become_user: root
+  template:
+    src: taskd.service
+    dest: /etc/systemd/system/taskd.service
+    mode: 0644
+  notify: Restart taskd
+  register: taskd_service
+
+- name: Reload systemd service
+  become: yes
+  become_user: root
+  systemd:
+    name: taskd.service
+    daemon_reload: yes
+    enabled: yes
+    state: started
+  when: taskd_service.changed
+
+- name: Ensure client organization
+  become: yes
+  become_user: "{{ t.username }}"
+  shell:
+    cmd: |
+      taskd add --data {{ t.data_location }} org '{{ t.org }}'
+  args:
+    creates: "{{ t.data_location }}/orgs/{{ t.org }}"
+
+- name: Check if user exists already
+  find:
+    paths: "{{ t.data_location }}/orgs/{{ t.org }}/users"
+    contains: "user={{ t.user }}"
+    recurse: yes
+  register: user_exists
+
+- name: Ensure client user
+  become: yes
+  become_user: "{{ t.username }}"
+  shell:
+    cmd: |
+      taskd add user '{{ t.org }}' '{{ t.user }}' --data {{ t.data_location }}
+  register: user
+  when: user_exists.matched == 0
+  notify: Restart taskd
+
+- name: Set fact with client user id
+  set_fact:
+    user_id: "{{ user_exists.files[0].path.split('/')[-2] }}"
+  when: user_exists.matched != 0
+
+- name: Set fact with client user id
+  set_fact:
+    user_id: "{{ user.stdout_lines[0].split(' ') | last }}"
+  when: user_exists.matched == 0
+
+- name: Set fact with user cert name
+  set_fact:
+    user_cert_name: "{{ t.org | regex_replace(' ', '_') }}_{{ t.user | regex_replace(' ', '_') }}"
+
+- name: Generate user certificate
+  become: yes
+  become_user: "{{ t.username }}"
+  command: "{{ t.data_location }}/pki/generate.client {{ user_cert_name }}"
+  args:
+    chdir: "{{ t.data_location }}/pki"
+  environment:
+    TASKDATA: "{{ t.data_location }}"
+  when: user_exists.matched == 0
+
+- name: Fetch needed user keys and certs locally
+  fetch:
+    src: "{{ t.data_location }}/pki/{{ item }}"
+    dest: "/tmp/{{ item }}"
+    flat: yes
+  with_items:
+    - "{{ user_cert_name }}.cert.pem"
+    - "{{ user_cert_name }}.key.pem"
+    - ca.cert.pem
+
+- name: Prepare variable to show after deployment
+  set_fact:
+    message: |
+      Your taskd server configuration succeded. Run next commands on taskwarrior client:
+
+        cp -f /tmp/{{ user_cert_name }}.cert.pem ~/.task/
+        cp -f /tmp/{{ user_cert_name }}.key.pem ~/.task/
+        cp -f /tmp/ca.cert.pem ~/.task/
+        task config taskd.certificate -- ~/.task/{{ user_cert_name }}.cert.pem
+        task config taskd.key -- ~/.task/{{ user_cert_name }}.key.pem
+        task config taskd.ca -- ~/.task/ca.cert.pem
+        task config taskd.server -- {{ t.cert.cn }}:{{ t.port }}
+        task config taskd.credentials -- '{{ t.org }}/{{ t.user }}/{{ user_id }}'
+
+- name: Show user vars
+  debug:
+    msg: "{{ message.split('\n') }}"
+
